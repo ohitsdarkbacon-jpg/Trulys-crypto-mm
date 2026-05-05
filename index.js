@@ -56,7 +56,7 @@ const client = new Client({
   ]
 });
 
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`✅ Bot online as ${client.user.tag}`);
   client.user.setActivity('🔒 Securing trades | !mm setup');
 });
@@ -123,7 +123,7 @@ client.on('interactionCreate', async (interaction) => {
   } catch (err) {
     console.error(err);
     if (!interaction.replied && !interaction.deferred) {
-      interaction.reply({ content: '❌ Error: ' + err.message, ephemeral: true });
+      interaction.reply({ content: '❌ Error: ' + err.message, flags: 64 });
     }
   }
 });
@@ -213,7 +213,7 @@ async function postPanel(channel) {
 // OPEN TICKET BUTTON — shows coin selector first
 // ─────────────────────────────────────────────
 async function handleOpenTicketButton(interaction) {
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: 64 });
 
   const guild     = interaction.guild;
   const user      = interaction.user;
@@ -271,10 +271,10 @@ async function handleOpenTicketButton(interaction) {
       .setCustomId(`coinSelect_${ticketId}`)
       .setPlaceholder('Choose a coin…')
       .addOptions(
-        new StringSelectMenuOptionBuilder().setLabel('Bitcoin (BTC)').setValue('BTC').setEmoji('₿'),
+        new StringSelectMenuOptionBuilder().setLabel('Bitcoin (BTC)').setValue('BTC').setEmoji('🟠'),
         new StringSelectMenuOptionBuilder().setLabel('Ethereum (ETH)').setValue('ETH').setEmoji('🔷'),
         new StringSelectMenuOptionBuilder().setLabel('Litecoin (LTC)').setValue('LTC').setEmoji('🪙'),
-        new StringSelectMenuOptionBuilder().setLabel('Solana (SOL)').setValue('SOL').setEmoji('◎'),
+        new StringSelectMenuOptionBuilder().setLabel('Solana (SOL)').setValue('SOL').setEmoji('🟣'),
         new StringSelectMenuOptionBuilder().setLabel('Tether (USDT)').setValue('USDT').setEmoji('💵'),
       )
   );
@@ -304,7 +304,7 @@ async function handleCoinSelect(interaction) {
 
   // Store chosen coin temporarily
   const ticket = db.get(`ticket_${ticketId}`);
-  if (!ticket) return interaction.reply({ content: '❌ Ticket not found.', ephemeral: true });
+  if (!ticket) return interaction.reply({ content: '❌ Ticket not found.', flags: 64 });
   ticket.pendingCoin = coin;
   db.set(`ticket_${ticketId}`, ticket);
 
@@ -348,7 +348,7 @@ async function handleCoinSelect(interaction) {
 // TRADE MODAL SUBMIT
 // ─────────────────────────────────────────────
 async function handleTradeModalSubmit(interaction, ticketId) {
-  await interaction.deferReply({ ephemeral: true });
+  await interaction.deferReply({ flags: 64 });
 
   const ticket = db.get(`ticket_${ticketId}`);
   if (!ticket) return interaction.editReply('❌ Ticket not found.');
@@ -500,10 +500,10 @@ async function startDeal(channel, buyer, seller, coin, coinAmount, usdAmount, us
 // ─────────────────────────────────────────────
 async function handleConfirmButton(interaction, dealId) {
   const deal = db.get(dealId);
-  if (!deal)                         return interaction.reply({ content: '❌ Deal not found.', ephemeral: true });
-  if (deal.buyer !== interaction.user.id) return interaction.reply({ content: '❌ Only the buyer can confirm.', ephemeral: true });
-  if (deal.status === 'COMPLETED')   return interaction.reply({ content: '✅ Already completed.', ephemeral: true });
-  if (deal.status === 'CANCELLED')   return interaction.reply({ content: '❌ Already cancelled.', ephemeral: true });
+  if (!deal)                         return interaction.reply({ content: '❌ Deal not found.', flags: 64 });
+  if (deal.buyer !== interaction.user.id) return interaction.reply({ content: '❌ Only the buyer can confirm.', flags: 64 });
+  if (deal.status === 'COMPLETED')   return interaction.reply({ content: '✅ Already completed.', flags: 64 });
+  if (deal.status === 'CANCELLED')   return interaction.reply({ content: '❌ Already cancelled.', flags: 64 });
 
   await interaction.deferReply();
 
@@ -553,11 +553,11 @@ async function handleConfirmButton(interaction, dealId) {
 // ─────────────────────────────────────────────
 async function handleCancelButton(interaction, dealId) {
   const deal = db.get(dealId);
-  if (!deal) return interaction.reply({ content: '❌ Deal not found.', ephemeral: true });
+  if (!deal) return interaction.reply({ content: '❌ Deal not found.', flags: 64 });
   if (deal.buyer !== interaction.user.id && deal.seller !== interaction.user.id)
-    return interaction.reply({ content: '❌ Not your deal.', ephemeral: true });
+    return interaction.reply({ content: '❌ Not your deal.', flags: 64 });
   if (deal.status === 'COMPLETED')
-    return interaction.reply({ content: '❌ Deal already completed — cannot cancel.', ephemeral: true });
+    return interaction.reply({ content: '❌ Deal already completed — cannot cancel.', flags: 64 });
 
   await interaction.deferReply();
 
@@ -584,9 +584,9 @@ async function handleCancelButton(interaction, dealId) {
 // ─────────────────────────────────────────────
 async function handleDisputeButton(interaction, dealId) {
   const deal = db.get(dealId);
-  if (!deal) return interaction.reply({ content: '❌ Deal not found.', ephemeral: true });
+  if (!deal) return interaction.reply({ content: '❌ Deal not found.', flags: 64 });
   if (deal.buyer !== interaction.user.id && deal.seller !== interaction.user.id)
-    return interaction.reply({ content: '❌ Not your deal.', ephemeral: true });
+    return interaction.reply({ content: '❌ Not your deal.', flags: 64 });
 
   deal.status = 'DISPUTE';
   db.set(dealId, deal);
@@ -626,7 +626,7 @@ async function handleCloseButton(interaction, ticketId) {
   const isOpener = ticket && ticket.opener === interaction.user.id;
 
   if (!isAdmin && !isOpener)
-    return interaction.reply({ content: '❌ Only admins or the ticket opener can close.', ephemeral: true });
+    return interaction.reply({ content: '❌ Only admins or the ticket opener can close.', flags: 64 });
 
   await interaction.reply('🔒 Closing ticket in 5 seconds…');
   setTimeout(() => interaction.channel.delete().catch(() => {}), 5000);
