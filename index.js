@@ -21,27 +21,93 @@ const COIN_IDS = {
   USDT: 'tether',
 };
 
-// Fetch live USD price for a coin; falls back to null on failure
-async function getCoinPriceUSD(coin) {
-  try {
-    const id  = COIN_IDS[coin];
+// Basic address format validators per coin
+const ADDRESS_PATTERNS = {
+  BTC:  /^(1|3|bc1)[a-zA-Z0-9]{25,62}$/,
+  ETH:  /^0x[a-fA-F0-9]{40}$/,
+  LTC:  /^(L|M|ltc1)[a-zA-Z0-9]{25,62}$/,
+  SOL:  /^[1-9A-HJ-NP-Za-km-z]{32,44}$/,
+  USDT: /^(0x[a-fA-F0-9]{40}|T[a-zA-Z0-9]{33})$/,
+};
+
+// Cooldown store to prevent confirm button spam (userId → timestamp)
+const confirmCooldowns = new Map();
+const CONFIRM_COOLDOWN_MS = 10_000;
+
+// ─────────────────────────────────────────────
+// PRICE FETCHING — retry + dual-endpoint for LTC reliability
+// ─────────────────────────────────────────────
+
+/**
+ * Fetch live USD price for a coin.
+ * Tries the simple/price endpoint first, falls back to the full coin endpoint.
+ * Retries up to 3 times with a 1.5s delay between attempts.
+ */
+async function getCoinPriceUSD(coin, retries = 3) {
+  if (coin === 'USDT') return 1;
+
+  const id = COIN_IDS[coin];
+
+  const fetchFromSimple = async () => {
     const res = await fetch(
-      `https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd`
+      `https://api.coingecko.com/api/v3/simple/price?ids=${id}&vs_currencies=usd`,
+      { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(8000) }
     );
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
-    return data[id]?.usd ?? null;
-  } catch {
-    return null;
+    const price = data[id]?.usd;
+    if (!price) throw new Error('No price in response');
+    return price;
+  };
+
+  const fetchFromCoinEndpoint = async () => {
+    const res = await fetch(
+      `https://api.coingecko.com/api/v3/coins/${id}?localization=false&tickers=false&market_data=true&community_data=false&developer_data=false`,
+      { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(8000) }
+    );
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    const price = data.market_data?.current_price?.usd;
+    if (!price) throw new Error('No price in response');
+    return price;
+  };
+
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      return await fetchFromSimple();
+    } catch {
+      try {
+        return await fetchFromCoinEndpoint();
+      } catch {
+        if (attempt < retries - 1) {
+          await new Promise(r => setTimeout(r, 1500));
+        }
+      }
+    }
   }
+
+  return null;
 }
 
-// Convert USD to coin amount (8 decimal places max)
 async function usdToCoin(usdAmount, coin) {
   if (coin === 'USDT') return { coinAmount: parseFloat(usdAmount.toFixed(2)), price: 1 };
   const price = await getCoinPriceUSD(coin);
   if (!price) return null;
   const coinAmount = parseFloat((usdAmount / price).toFixed(8));
   return { coinAmount, price };
+}
+
+// ─────────────────────────────────────────────
+// AUDIT LOG
+// ─────────────────────────────────────────────
+
+async function auditLog(guild, embed) {
+  try {
+    const logChannelId = config.AUDIT_LOG_CHANNEL_ID;
+    if (!logChannelId) return;
+    const ch = await guild.channels.fetch(logChannelId).catch(() => null);
+    if (ch) ch.send({ embeds: [embed] });
+  } catch { /* non-critical */ }
 }
 
 // ─────────────────────────────────────────────
@@ -82,6 +148,7 @@ client.on('messageCreate', async (message) => {
         case 'dispute':  return handleDispute(message, args);
         case 'close':    return handleClose(message);
         case 'add':      return handleAdd(message, args);
+        case 'deals':    return handleDeals(message);
         default:         return handleHelp(message);
       }
     }
@@ -96,25 +163,24 @@ client.on('messageCreate', async (message) => {
 // ─────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
   try {
-    // ── Buttons ──
     if (interaction.isButton()) {
       const [action, ...rest] = interaction.customId.split('_');
       switch (action) {
-        case 'openTicket':   return handleOpenTicketButton(interaction);
-        case 'confirmDeal':  return handleConfirmButton(interaction, rest[0]);
-        case 'cancelDeal':   return handleCancelButton(interaction, rest[0]);
-        case 'disputeDeal':  return handleDisputeButton(interaction, rest[0]);
-        case 'closeTicket':  return handleCloseButton(interaction, rest[0]);
+        case 'openTicket':    return handleOpenTicketButton(interaction);
+        case 'confirmDeal':   return handleConfirmButton(interaction, rest[0]);
+        case 'cancelDeal':    return handleCancelButton(interaction, rest[0]);
+        case 'disputeDeal':   return handleDisputeButton(interaction, rest[0]);
+        case 'closeTicket':   return handleCloseButton(interaction, rest[0]);
+        case 'claimFunds':    return handleClaimFundsButton(interaction, rest[0]);
       }
     }
 
-    // ── Modal submissions ──
     if (interaction.isModalSubmit()) {
       const [action, ...rest] = interaction.customId.split('_');
-      if (action === 'tradeModal') return handleTradeModalSubmit(interaction, rest[0]);
+      if (action === 'tradeModal')  return handleTradeModalSubmit(interaction, rest[0]);
+      if (action === 'claimModal')  return handleClaimModalSubmit(interaction, rest[0]);
     }
 
-    // ── Select menus ──
     if (interaction.isStringSelectMenu()) {
       if (interaction.customId.startsWith('coinSelect_')) {
         return handleCoinSelect(interaction);
@@ -166,7 +232,7 @@ async function handleSetup(message) {
     .addFields(
       { name: '📁 Category', value: category.name },
       { name: '📬 Panel',    value: `<#${panelChannel.id}>` },
-      { name: '📌 Next',     value: 'Users open trades by clicking the button in that channel.' }
+      { name: '📌 Next',     value: 'Users open trades by clicking the button in that channel.\n\nOptionally set `AUDIT_LOG_CHANNEL_ID` in config to enable deal audit logging.' }
     );
   message.channel.send({ embeds: [embed] });
 }
@@ -192,9 +258,9 @@ async function postPanel(channel) {
       '**Fee:** 1% taken on release · **Amounts entered in USD**\n\n' +
       '**How it works:**\n' +
       '`1.` Click **Open Trade Ticket** below\n' +
-      '`2.` Fill in the form — enter the USD value of the trade\n' +
-      '`3.` Bot converts to crypto at live rate\n' +
-      '`4.` Buyer deposits → Seller delivers → Buyer confirms → Funds released ✅'
+      '`2.` Choose your coin and fill in the form\n' +
+      '`3.` Buyer deposits → Seller delivers → Buyer confirms\n' +
+      '`4.` Seller clicks **💰 Claim Funds** and enters their payout address ✅'
     )
     .setFooter({ text: 'Live prices via CoinGecko · Fresh wallet every deal.' })
     .setTimestamp();
@@ -210,7 +276,7 @@ async function postPanel(channel) {
 }
 
 // ─────────────────────────────────────────────
-// OPEN TICKET BUTTON — shows coin selector first
+// OPEN TICKET BUTTON
 // ─────────────────────────────────────────────
 async function handleOpenTicketButton(interaction) {
   await interaction.deferReply({ flags: 64 });
@@ -226,7 +292,6 @@ async function handleOpenTicketButton(interaction) {
   if (existing)
     return interaction.editReply(`❌ You already have an open ticket: <#${existing.channelId}>`);
 
-  // Create the private channel immediately
   const safeName = user.username.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 20);
   const ticketChannel = await guild.channels.create({
     name: `trade-${safeName}-${Date.now().toString(36)}`,
@@ -255,14 +320,13 @@ async function handleOpenTicketButton(interaction) {
     createdAt: Date.now(),
   });
 
-  // ── Step 1: coin selector embed ──
   const coinEmbed = new EmbedBuilder()
     .setColor('#f0a500')
     .setTitle('🔒 Trade Ticket — Step 1 of 2')
     .setDescription(
       `Welcome <@${user.id}>!\n\n` +
-      '**Select the cryptocurrency** you want to use for this trade.\n' +
-      'You will enter the **USD amount** in the next step — the bot will convert it to crypto at the live rate.'
+      '**Select the cryptocurrency** for this trade.\n' +
+      'You\'ll enter the **USD amount** in the next step — the bot converts it at the live rate.'
     )
     .setFooter({ text: `Ticket: ${ticketId} · Prices via CoinGecko` });
 
@@ -302,13 +366,11 @@ async function handleCoinSelect(interaction) {
   const ticketId = interaction.customId.split('_')[1];
   const coin     = interaction.values[0];
 
-  // Store chosen coin temporarily
   const ticket = db.get(`ticket_${ticketId}`);
   if (!ticket) return interaction.reply({ content: '❌ Ticket not found.', flags: 64 });
   ticket.pendingCoin = coin;
   db.set(`ticket_${ticketId}`, ticket);
 
-  // ── Show modal for trade details ──
   const modal = new ModalBuilder()
     .setCustomId(`tradeModal_${ticketId}`)
     .setTitle(`Trade Setup — ${coin}`);
@@ -331,7 +393,7 @@ async function handleCoinSelect(interaction) {
     .setCustomId('description')
     .setLabel('Trade description')
     .setStyle(TextInputStyle.Paragraph)
-    .setPlaceholder('e.g. Trading for $150 Amazon gift card')
+    .setPlaceholder('e.g. Trading $150 Amazon gift card')
     .setMaxLength(300)
     .setRequired(false);
 
@@ -358,14 +420,12 @@ async function handleTradeModalSubmit(interaction, ticketId) {
   const rawUsd      = interaction.fields.getTextInputValue('usdAmount').trim().replace(/[$,]/g, '');
   const description = interaction.fields.getTextInputValue('description').trim() || 'No description provided';
 
-  // Validate USD
   const usdAmount = parseFloat(rawUsd);
   if (isNaN(usdAmount) || usdAmount <= 0)
     return interaction.editReply('❌ Invalid USD amount. Enter a positive number like `150.00`.');
   if (usdAmount < 1)
     return interaction.editReply('❌ Minimum trade value is **$1.00 USD**.');
 
-  // Validate seller
   let seller;
   try {
     seller = await interaction.guild.members.fetch(rawSeller);
@@ -378,24 +438,32 @@ async function handleTradeModalSubmit(interaction, ticketId) {
   if (seller.user.bot)
     return interaction.editReply('❌ Cannot trade with a bot.');
 
-  // Convert USD → coin
+  // Guard: prevent same two users from having multiple active deals
+  const duplicateDeal = findActiveDealBetween(interaction.user.id, seller.id);
+  if (duplicateDeal)
+    return interaction.editReply(`❌ You already have an active deal with that user: \`${duplicateDeal.id}\``);
+
+  // Notify while fetching price (can take a moment, especially for LTC)
+  await interaction.editReply(`⏳ Fetching live **${coin}** price…`);
+
   const conversion = await usdToCoin(usdAmount, coin);
   if (!conversion)
-    return interaction.editReply(`❌ Could not fetch live price for **${coin}**. Please try again in a moment.`);
+    return interaction.editReply(
+      `❌ Could not fetch live price for **${coin}** after multiple retries.\n` +
+      `CoinGecko may be rate-limiting. Please wait 60 seconds and try again.`
+    );
 
   const { coinAmount, price } = conversion;
 
-  // Fetch the ticket channel
   const channel = await interaction.guild.channels.fetch(ticket.channelId).catch(() => null);
   if (!channel) return interaction.editReply('❌ Ticket channel not found.');
 
-  await interaction.editReply('✅ Trade is being set up…');
-
+  await interaction.editReply('✅ Price fetched! Setting up deal…');
   await startDeal(channel, interaction.user, seller.user, coin, coinAmount, usdAmount, price, description, ticketId);
 }
 
 // ─────────────────────────────────────────────
-// START DEAL — adds seller, generates wallet
+// START DEAL
 // ─────────────────────────────────────────────
 async function startDeal(channel, buyer, seller, coin, coinAmount, usdAmount, usdPrice, description, ticketId) {
   const fee            = parseFloat((coinAmount * 0.01).toFixed(8));
@@ -439,7 +507,6 @@ async function startDeal(channel, buyer, seller, coin, coinAmount, usdAmount, us
   };
   db.set(dealId, deal);
 
-  // Update ticket record
   const ticket = db.get(`ticket_${ticketId}`);
   if (ticket) {
     ticket.dealId  = dealId;
@@ -448,31 +515,32 @@ async function startDeal(channel, buyer, seller, coin, coinAmount, usdAmount, us
     db.set(`ticket_${ticketId}`, ticket);
   }
 
-  const priceStr = coin === 'USDT' ? '1.00' : usdPrice.toLocaleString('en-US', { maximumFractionDigits: 2 });
+  const priceStr = coin === 'USDT'
+    ? '1.00'
+    : usdPrice.toLocaleString('en-US', { maximumFractionDigits: 2 });
 
   const embed = new EmbedBuilder()
     .setColor('#f0a500')
     .setTitle(`🔒 Escrow Deal Active — \`${dealId}\``)
     .setDescription(`<@${buyer.id}> **(Buyer)** ↔ <@${seller.id}> **(Seller)**\n\n${description}`)
     .addFields(
-      { name: '💵 Trade Value (USD)',    value: `**$${usdAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}**`, inline: true },
-      { name: '🪙 Coin',                value: coin,                                        inline: true },
-      { name: '📈 Rate',                value: `$${priceStr} / ${coin}`,                   inline: true },
-      { name: '💰 Amount',              value: `${coinAmount} ${coin}`,                    inline: true },
-      { name: '💸 Fee (1%)',            value: `${fee} ${coin} (~$${feeUsd})`,             inline: true },
-      { name: '📤 Seller Receives',     value: `${sellerReceives} ${coin} (~$${sellerUsd})`, inline: true },
+      { name: '💵 Trade Value (USD)',  value: `**$${usdAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}**`, inline: true },
+      { name: '🪙 Coin',              value: coin,                                              inline: true },
+      { name: '📈 Rate',              value: `$${priceStr} / ${coin}`,                         inline: true },
+      { name: '💰 Amount',            value: `${coinAmount} ${coin}`,                          inline: true },
+      { name: '💸 Fee (1%)',          value: `${fee} ${coin} (~$${feeUsd})`,                   inline: true },
+      { name: '📤 Seller Receives',   value: `${sellerReceives} ${coin} (~$${sellerUsd})`,     inline: true },
       {
         name: `📬 Deposit Address (${coin})`,
-        value:
-          `> Tap to copy on mobile:\n` +
-          `\`\`\`\n${wallet.address}\n\`\`\``,
+        value: `\`\`\`\n${wallet.address}\n\`\`\``,
       },
       {
         name: '📋 Steps',
         value:
           `**1.** <@${buyer.id}> — send \`${coinAmount} ${coin}\` to the address above\n` +
-          `**2.** <@${seller.id}> — deliver the item/gift card to the buyer\n` +
-          `**3.** <@${buyer.id}> — click **✅ Confirm Receipt** once delivered → funds auto-released`,
+          `**2.** <@${seller.id}> — deliver the item/service to the buyer\n` +
+          `**3.** <@${buyer.id}> — click **✅ Confirm Receipt** once satisfied\n` +
+          `**4.** <@${seller.id}> — click **💰 Claim Funds** and enter your payout address`,
       },
       { name: '🕐 Status', value: '`PENDING_DEPOSIT`' },
     )
@@ -485,25 +553,58 @@ async function startDeal(channel, buyer, seller, coin, coinAmount, usdAmount, us
     new ButtonBuilder().setCustomId(`disputeDeal_${dealId}`).setLabel('⚠️ Dispute').setStyle(ButtonStyle.Secondary),
   );
 
-  // ── Send embed first ──
   await channel.send({ content: `<@${buyer.id}> <@${seller.id}>`, embeds: [embed], components: [row] });
 
-  // ── Then send address as a plain copyable message (critical for mobile) ──
-  await channel.send(
-    `📋 **Copy address below** (tap & hold on mobile):\n` +
-    `\`${wallet.address}\``
+  // Plain copyable address (critical for mobile)
+  await channel.send(`📋 **Copy deposit address** (tap & hold on mobile):\n\`${wallet.address}\``);
+
+  // Schedule a deposit timeout warning at 30 minutes
+  setTimeout(async () => {
+    const freshDeal = db.get(dealId);
+    if (!freshDeal || freshDeal.status !== 'PENDING_DEPOSIT') return;
+    try {
+      const balance = await getBalance(coin, wallet.address);
+      if (balance < coinAmount * 0.99) {
+        channel.send(
+          `⏰ **Deposit reminder** — <@${buyer.id}>, no deposit detected after 30 minutes.\n` +
+          `Expected: \`${coinAmount} ${coin}\` → \`${wallet.address}\`\n` +
+          `If this trade is no longer needed, click **❌ Cancel**.`
+        ).catch(() => {});
+      }
+    } catch { /* ignore */ }
+  }, 30 * 60 * 1000);
+
+  // Audit log
+  await auditLog(channel.guild, new EmbedBuilder()
+    .setColor('#f0a500')
+    .setTitle(`📋 Deal Opened — \`${dealId}\``)
+    .addFields(
+      { name: 'Buyer',  value: `<@${buyer.id}>`,  inline: true },
+      { name: 'Seller', value: `<@${seller.id}>`, inline: true },
+      { name: 'Amount', value: `${coinAmount} ${coin} (~$${usdAmount})`, inline: true },
+    )
+    .setTimestamp()
   );
 }
 
 // ─────────────────────────────────────────────
-// CONFIRM BUTTON
+// CONFIRM BUTTON  (buyer only)
 // ─────────────────────────────────────────────
 async function handleConfirmButton(interaction, dealId) {
   const deal = db.get(dealId);
-  if (!deal)                         return interaction.reply({ content: '❌ Deal not found.', flags: 64 });
-  if (deal.buyer !== interaction.user.id) return interaction.reply({ content: '❌ Only the buyer can confirm.', flags: 64 });
-  if (deal.status === 'COMPLETED')   return interaction.reply({ content: '✅ Already completed.', flags: 64 });
-  if (deal.status === 'CANCELLED')   return interaction.reply({ content: '❌ Already cancelled.', flags: 64 });
+  if (!deal)                              return interaction.reply({ content: '❌ Deal not found.', flags: 64 });
+  if (deal.buyer !== interaction.user.id) return interaction.reply({ content: '❌ Only the buyer can confirm receipt.', flags: 64 });
+  if (deal.status === 'COMPLETED')        return interaction.reply({ content: '✅ This deal is already completed.', flags: 64 });
+  if (deal.status === 'CANCELLED')        return interaction.reply({ content: '❌ This deal was cancelled.', flags: 64 });
+  if (deal.status === 'AWAITING_CLAIM')   return interaction.reply({ content: '⏳ Already confirmed — waiting for seller to claim funds.', flags: 64 });
+
+  // Cooldown check
+  const lastConfirm = confirmCooldowns.get(interaction.user.id);
+  if (lastConfirm && Date.now() - lastConfirm < CONFIRM_COOLDOWN_MS) {
+    const remaining = Math.ceil((CONFIRM_COOLDOWN_MS - (Date.now() - lastConfirm)) / 1000);
+    return interaction.reply({ content: `⏳ Please wait ${remaining}s before trying again.`, flags: 64 });
+  }
+  confirmCooldowns.set(interaction.user.id, Date.now());
 
   await interaction.deferReply();
 
@@ -513,39 +614,109 @@ async function handleConfirmButton(interaction, dealId) {
       .setColor('#ff6600')
       .setTitle('⏳ Funds Not Yet Detected')
       .addFields(
-        { name: '📬 Address',  value: `\`${deal.wallet}\``, inline: false },
-        { name: '🎯 Expected', value: `${deal.amount} ${deal.coin}`, inline: true },
+        { name: '📬 Address',  value: `\`${deal.wallet}\``,          inline: false },
+        { name: '🎯 Expected', value: `${deal.amount} ${deal.coin}`,  inline: true },
         { name: '💵 In USD',   value: `~$${deal.usdAmount?.toFixed(2) ?? '?'}`, inline: true },
-        { name: '📊 Current',  value: `${balance} ${deal.coin}`, inline: true },
+        { name: '📊 Current',  value: `${balance} ${deal.coin}`,     inline: true },
       )
-      .setDescription('Wait for network confirmations and try again. Usually takes 1–3 minutes.');
+      .setDescription('Wait for network confirmations and try again. Usually 1–3 minutes.');
     return interaction.editReply({ embeds: [embed] });
   }
 
-  deal.status = 'AWAITING_PAYOUT_ADDRESS';
+  deal.status = 'AWAITING_CLAIM';
   db.set(dealId, deal);
 
-  const embed = new EmbedBuilder()
+  const confirmedEmbed = new EmbedBuilder()
     .setColor('#00ff88')
-    .setTitle('✅ Funds Confirmed!')
+    .setTitle('✅ Receipt Confirmed!')
     .setDescription(
-      `<@${deal.seller}> — funds are in escrow! Please **reply in this channel** with your **${deal.coin} payout address** to receive \`${deal.sellerReceives} ${deal.coin}\` (~$${deal.sellerUsd ?? '?'}).`
+      `<@${deal.buyer}> has confirmed receipt of the item/service.\n\n` +
+      `<@${deal.seller}> — click **💰 Claim Funds** below to enter your **${deal.coin} payout address** and receive \`${deal.sellerReceives} ${deal.coin}\` (~$${deal.sellerUsd ?? '?'}).`
     );
 
-  await interaction.editReply({ embeds: [embed] });
+  const claimRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`claimFunds_${dealId}`)
+      .setLabel('💰 Claim Funds')
+      .setStyle(ButtonStyle.Success),
+    new ButtonBuilder()
+      .setCustomId(`disputeDeal_${dealId}`)
+      .setLabel('⚠️ Dispute')
+      .setStyle(ButtonStyle.Secondary),
+  );
 
-  const collector = interaction.channel.createMessageCollector({
-    filter: (m) => m.author.id === deal.seller && !m.author.bot,
-    max: 1, time: 300000,
-  });
-  collector.on('collect', async (m) => {
-    await releaseToSeller(interaction.channel, deal, m.content.trim(), dealId);
-  });
-  collector.on('end', (collected) => {
-    if (collected.size === 0) {
-      interaction.channel.send(`⏰ Timed out. <@${deal.seller}> run \`!mm release ${dealId} <your_address>\` to retry.`);
-    }
-  });
+  await interaction.editReply({ embeds: [confirmedEmbed], components: [claimRow] });
+
+  await auditLog(interaction.guild, new EmbedBuilder()
+    .setColor('#00ff88')
+    .setTitle(`✅ Receipt Confirmed — \`${dealId}\``)
+    .addFields(
+      { name: 'Buyer',  value: `<@${deal.buyer}>`,  inline: true },
+      { name: 'Seller', value: `<@${deal.seller}>`, inline: true },
+      { name: 'Status', value: 'Awaiting seller claim', inline: true },
+    )
+    .setTimestamp()
+  );
+}
+
+// ─────────────────────────────────────────────
+// CLAIM FUNDS BUTTON  (seller only) → opens modal
+// ─────────────────────────────────────────────
+async function handleClaimFundsButton(interaction, dealId) {
+  const deal = db.get(dealId);
+  if (!deal)
+    return interaction.reply({ content: '❌ Deal not found.', flags: 64 });
+  if (deal.seller !== interaction.user.id)
+    return interaction.reply({ content: '❌ Only the seller can claim funds.', flags: 64 });
+  if (deal.status !== 'AWAITING_CLAIM')
+    return interaction.reply({ content: '❌ Funds are not ready to be claimed yet. Wait for the buyer to confirm receipt.', flags: 64 });
+
+  const modal = new ModalBuilder()
+    .setCustomId(`claimModal_${dealId}`)
+    .setTitle(`Claim ${deal.sellerReceives} ${deal.coin}`);
+
+  const addressInput = new TextInputBuilder()
+    .setCustomId('payoutAddress')
+    .setLabel(`Your ${deal.coin} payout address`)
+    .setStyle(TextInputStyle.Short)
+    .setPlaceholder(getAddressPlaceholder(deal.coin))
+    .setMinLength(20)
+    .setRequired(true);
+
+  modal.addComponents(new ActionRowBuilder().addComponents(addressInput));
+  await interaction.showModal(modal);
+}
+
+// ─────────────────────────────────────────────
+// CLAIM MODAL SUBMIT
+// ─────────────────────────────────────────────
+async function handleClaimModalSubmit(interaction, dealId) {
+  await interaction.deferReply({ flags: 64 });
+
+  const deal = db.get(dealId);
+  if (!deal)
+    return interaction.editReply('❌ Deal not found.');
+  if (deal.seller !== interaction.user.id)
+    return interaction.editReply('❌ Only the seller can claim.');
+  if (deal.status !== 'AWAITING_CLAIM')
+    return interaction.editReply('❌ This deal is not in a claimable state.');
+
+  const payoutAddress = interaction.fields.getTextInputValue('payoutAddress').trim();
+
+  // Validate address format
+  const pattern = ADDRESS_PATTERNS[deal.coin];
+  if (pattern && !pattern.test(payoutAddress)) {
+    return interaction.editReply(
+      `❌ **Invalid ${deal.coin} address format.**\n` +
+      `Please double-check your address and try again.\n` +
+      `Expected format example: \`${getAddressPlaceholder(deal.coin)}\``
+    );
+  }
+
+  await interaction.editReply(`⏳ Processing payout of \`${deal.sellerReceives} ${deal.coin}\` to \`${payoutAddress}\`…`);
+
+  const channel = await interaction.guild.channels.fetch(deal.channelId).catch(() => null);
+  await releaseToSeller(channel, deal, payoutAddress, dealId);
 }
 
 // ─────────────────────────────────────────────
@@ -553,11 +724,14 @@ async function handleConfirmButton(interaction, dealId) {
 // ─────────────────────────────────────────────
 async function handleCancelButton(interaction, dealId) {
   const deal = db.get(dealId);
-  if (!deal) return interaction.reply({ content: '❌ Deal not found.', flags: 64 });
+  if (!deal)
+    return interaction.reply({ content: '❌ Deal not found.', flags: 64 });
   if (deal.buyer !== interaction.user.id && deal.seller !== interaction.user.id)
     return interaction.reply({ content: '❌ Not your deal.', flags: 64 });
   if (deal.status === 'COMPLETED')
     return interaction.reply({ content: '❌ Deal already completed — cannot cancel.', flags: 64 });
+  if (deal.status === 'AWAITING_CLAIM')
+    return interaction.reply({ content: '❌ Buyer already confirmed receipt — use **⚠️ Dispute** if there is an issue.', flags: 64 });
 
   await interaction.deferReply();
 
@@ -577,6 +751,13 @@ async function handleCancelButton(interaction, dealId) {
     .setDescription(`Cancelled by <@${interaction.user.id}>.\nNo funds were in escrow.\n\n_Ticket closes in 30 seconds._`);
   await interaction.editReply({ embeds: [embed] });
   setTimeout(() => interaction.channel.delete().catch(() => {}), 30000);
+
+  await auditLog(interaction.guild, new EmbedBuilder()
+    .setColor('#ff4444')
+    .setTitle(`❌ Deal Cancelled — \`${dealId}\``)
+    .addFields({ name: 'By', value: `<@${interaction.user.id}>`, inline: true })
+    .setTimestamp()
+  );
 }
 
 // ─────────────────────────────────────────────
@@ -584,7 +765,8 @@ async function handleCancelButton(interaction, dealId) {
 // ─────────────────────────────────────────────
 async function handleDisputeButton(interaction, dealId) {
   const deal = db.get(dealId);
-  if (!deal) return interaction.reply({ content: '❌ Deal not found.', flags: 64 });
+  if (!deal)
+    return interaction.reply({ content: '❌ Deal not found.', flags: 64 });
   if (deal.buyer !== interaction.user.id && deal.seller !== interaction.user.id)
     return interaction.reply({ content: '❌ Not your deal.', flags: 64 });
 
@@ -605,16 +787,26 @@ async function handleDisputeButton(interaction, dealId) {
     .setTitle(`⚠️ Dispute Opened — \`${dealId}\``)
     .setDescription(
       `Filed by <@${interaction.user.id}>.\n\n` +
-      '**Admins have been added to this ticket** and will review the situation.\n' +
-      'Please describe your issue in detail below.'
+      '**Admins have been added to this ticket.** Please describe your issue in detail below.\n\n' +
+      `Admin force-release: \`!mm release ${dealId} <address>\``
     )
     .addFields(
-      { name: '💰 Amount',  value: `${deal.amount} ${deal.coin}`, inline: true },
-      { name: '💵 USD',     value: deal.usdAmount ? `~$${deal.usdAmount.toFixed(2)}` : 'N/A', inline: true },
-      { name: '🔄 Status',  value: `\`${deal.status}\``, inline: true },
+      { name: '💰 Amount', value: `${deal.amount} ${deal.coin}`, inline: true },
+      { name: '💵 USD',    value: deal.usdAmount ? `~$${deal.usdAmount.toFixed(2)}` : 'N/A', inline: true },
+      { name: '🔄 Status', value: `\`DISPUTE\``, inline: true },
     );
 
   await interaction.reply({ embeds: [embed] });
+
+  await auditLog(interaction.guild, new EmbedBuilder()
+    .setColor('#ff6600')
+    .setTitle(`⚠️ Dispute — \`${dealId}\``)
+    .addFields(
+      { name: 'Filed By', value: `<@${interaction.user.id}>`, inline: true },
+      { name: 'Amount',   value: `${deal.amount} ${deal.coin}`, inline: true },
+    )
+    .setTimestamp()
+  );
 }
 
 // ─────────────────────────────────────────────
@@ -636,11 +828,16 @@ async function handleCloseButton(interaction, ticketId) {
 // RELEASE FUNDS
 // ─────────────────────────────────────────────
 async function releaseToSeller(channel, deal, payoutAddress, dealId) {
-  const loadEmbed = new EmbedBuilder()
-    .setColor('#0099ff')
-    .setTitle(`💸 Processing Payout — \`${dealId}\``)
-    .setDescription(`Sending \`${deal.sellerReceives} ${deal.coin}\` to:\n\`${payoutAddress}\`\n\n_This may take a moment…_`);
-  await channel.send({ embeds: [loadEmbed] });
+  const send = async (payload) => {
+    if (channel) await channel.send(payload).catch(() => {});
+  };
+
+  await send({ embeds: [
+    new EmbedBuilder()
+      .setColor('#0099ff')
+      .setTitle(`💸 Processing Payout — \`${dealId}\``)
+      .setDescription(`Sending \`${deal.sellerReceives} ${deal.coin}\` to:\n\`${payoutAddress}\`\n\n_This may take a moment…_`)
+  ]});
 
   try {
     const txHash = await sendTransaction(deal.coin, deal.privateKey, deal.wallet, payoutAddress, deal.sellerReceives);
@@ -649,20 +846,6 @@ async function releaseToSeller(channel, deal, payoutAddress, dealId) {
     deal.payoutAddress = payoutAddress;
     db.set(dealId, deal);
 
-    const doneEmbed = new EmbedBuilder()
-      .setColor('#00ff88')
-      .setTitle(`🎉 Deal Complete — \`${dealId}\``)
-      .setDescription('✅ Trade successful! Funds have been released to the seller.')
-      .addFields(
-        { name: '✅ Status',        value: '`COMPLETED`',                                       inline: true },
-        { name: '💰 Sent',          value: `${deal.sellerReceives} ${deal.coin}`,               inline: true },
-        { name: '💵 USD Value',     value: deal.sellerUsd ? `~$${deal.sellerUsd}` : 'N/A',    inline: true },
-        { name: '📬 Paid To',       value: `\`${payoutAddress}\``,                             inline: false },
-        { name: '🔗 TX Hash',       value: txHash ? `\`${txHash}\`` : '_Pending confirmation_' },
-      )
-      .setFooter({ text: 'Ticket closes in 60 seconds.' })
-      .setTimestamp();
-
     const closeRow = new ActionRowBuilder().addComponents(
       new ButtonBuilder()
         .setCustomId(`closeTicket_${deal.ticketId}`)
@@ -670,51 +853,82 @@ async function releaseToSeller(channel, deal, payoutAddress, dealId) {
         .setStyle(ButtonStyle.Secondary)
     );
 
-    await channel.send({
+    await send({
       content: `<@${deal.buyer}> <@${deal.seller}>`,
-      embeds: [doneEmbed],
+      embeds: [new EmbedBuilder()
+        .setColor('#00ff88')
+        .setTitle(`🎉 Deal Complete — \`${dealId}\``)
+        .setDescription('✅ Trade successful! Funds have been released to the seller.')
+        .addFields(
+          { name: '✅ Status',    value: '`COMPLETED`',                                    inline: true },
+          { name: '💰 Sent',      value: `${deal.sellerReceives} ${deal.coin}`,            inline: true },
+          { name: '💵 USD Value', value: deal.sellerUsd ? `~$${deal.sellerUsd}` : 'N/A',  inline: true },
+          { name: '📬 Paid To',   value: `\`${payoutAddress}\``,                          inline: false },
+          { name: '🔗 TX Hash',   value: txHash ? `\`${txHash}\`` : '_Pending confirmation_' },
+        )
+        .setFooter({ text: 'Ticket closes in 60 seconds.' })
+        .setTimestamp()
+      ],
       components: [closeRow],
     });
-    setTimeout(() => channel.delete().catch(() => {}), 60000);
+
+    if (channel) setTimeout(() => channel.delete().catch(() => {}), 60000);
+
+    if (channel?.guild) {
+      await auditLog(channel.guild, new EmbedBuilder()
+        .setColor('#00ff88')
+        .setTitle(`🎉 Deal Completed — \`${dealId}\``)
+        .addFields(
+          { name: 'Buyer',   value: `<@${deal.buyer}>`,  inline: true },
+          { name: 'Seller',  value: `<@${deal.seller}>`, inline: true },
+          { name: 'Sent',    value: `${deal.sellerReceives} ${deal.coin}`, inline: true },
+          { name: 'TX Hash', value: txHash ? `\`${txHash}\`` : 'N/A' },
+        )
+        .setTimestamp()
+      );
+    }
 
   } catch (err) {
     console.error(err);
-    channel.send(
+    await send(
       `❌ **Payout failed:** \`${err.message}\`\n` +
       `Contact an admin with deal ID \`${dealId}\`.\n` +
-      `Admin can force-release with: \`!mm release ${dealId} <address>\``
+      `Admin can force-release with: \`!mm release ${dealId} ${payoutAddress}\``
     );
   }
 }
 
 // ─────────────────────────────────────────────
-// TEXT COMMANDS (inside ticket channels)
+// TEXT COMMANDS
 // ─────────────────────────────────────────────
 async function handleConfirm(message, args) {
   const dealId = args[0];
   if (!dealId) return message.reply('❌ Usage: `!mm confirm <dealID>`');
   const deal = db.get(dealId);
-  if (!deal) return message.reply('❌ Deal not found.');
-  if (deal.buyer !== message.author.id) return message.reply('❌ Only the buyer can confirm.');
+  if (!deal)                             return message.reply('❌ Deal not found.');
+  if (deal.buyer !== message.author.id)  return message.reply('❌ Only the buyer can confirm.');
+  if (deal.status === 'AWAITING_CLAIM')  return message.reply('⏳ Already confirmed — waiting for seller to claim.');
 
   const balance = await getBalance(deal.coin, deal.wallet);
   if (balance < deal.amount * 0.99) {
     return message.reply(
-      `⏳ Funds not detected yet.\n` +
-      `Expected: \`${deal.amount} ${deal.coin}\` | Balance: \`${balance} ${deal.coin}\``
+      `⏳ Funds not detected yet.\nExpected: \`${deal.amount} ${deal.coin}\` | Balance: \`${balance} ${deal.coin}\``
     );
   }
 
-  deal.status = 'AWAITING_PAYOUT_ADDRESS';
+  deal.status = 'AWAITING_CLAIM';
   db.set(dealId, deal);
-  message.channel.send(`✅ Confirmed! <@${deal.seller}>, reply with your **${deal.coin} payout address**.`);
 
-  const collector = message.channel.createMessageCollector({
-    filter: (m) => m.author.id === deal.seller && !m.author.bot,
-    max: 1, time: 300000,
-  });
-  collector.on('collect', async (m) => {
-    await releaseToSeller(message.channel, deal, m.content.trim(), dealId);
+  const claimRow = new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`claimFunds_${dealId}`)
+      .setLabel('💰 Claim Funds')
+      .setStyle(ButtonStyle.Success),
+  );
+
+  message.channel.send({
+    content: `✅ Receipt confirmed by <@${deal.buyer}>!\n\n<@${deal.seller}> — click **💰 Claim Funds** below to enter your payout address.`,
+    components: [claimRow],
   });
 }
 
@@ -723,8 +937,10 @@ async function handleCancel(message, args) {
   if (!dealId) return message.reply('❌ Usage: `!mm cancel <dealID>`');
   const deal = db.get(dealId);
   if (!deal) return message.reply('❌ Deal not found.');
-  if (deal.buyer !== message.author.id && deal.seller !== message.author.id) return message.reply('❌ Not your deal.');
-  if (deal.status === 'COMPLETED') return message.reply('❌ Already completed.');
+  if (deal.buyer !== message.author.id && deal.seller !== message.author.id)
+    return message.reply('❌ Not your deal.');
+  if (deal.status === 'COMPLETED')      return message.reply('❌ Already completed.');
+  if (deal.status === 'AWAITING_CLAIM') return message.reply('❌ Already confirmed — use `!mm dispute` if there is an issue.');
 
   const balance = await getBalance(deal.coin, deal.wallet);
   if (balance > 0) return message.reply(`⚠️ Funds in escrow. Use \`!mm dispute ${dealId}\` for admin help.`);
@@ -741,36 +957,39 @@ async function handleStatus(message, args) {
   const deal = db.get(dealId);
   if (!deal) return message.reply('❌ Deal not found.');
 
-  const balance = await getBalance(deal.coin, deal.wallet);
-  const colors  = {
+  const [balance, livePrice] = await Promise.all([
+    getBalance(deal.coin, deal.wallet),
+    getCoinPriceUSD(deal.coin),
+  ]);
+  const liveUsdValue = livePrice ? (balance * livePrice).toFixed(2) : null;
+
+  const colors = {
     PENDING_DEPOSIT: '#f0a500',
-    AWAITING_PAYOUT_ADDRESS: '#0099ff',
-    COMPLETED: '#00ff88',
-    CANCELLED: '#ff4444',
-    DISPUTE: '#ff6600',
+    AWAITING_CLAIM:  '#0099ff',
+    COMPLETED:       '#00ff88',
+    CANCELLED:       '#ff4444',
+    DISPUTE:         '#ff6600',
   };
 
   const embed = new EmbedBuilder()
     .setColor(colors[deal.status] || '#888888')
     .setTitle(`📋 Status — \`${dealId}\``)
     .addFields(
-      { name: '🔄 Status',       value: `\`${deal.status}\``,              inline: true },
-      { name: '🪙 Coin',         value: deal.coin,                          inline: true },
-      { name: '💵 USD Value',    value: deal.usdAmount ? `$${deal.usdAmount.toFixed(2)}` : 'N/A', inline: true },
-      { name: '💰 Amount',       value: `${deal.amount} ${deal.coin}`,     inline: true },
-      { name: '📊 Escrow Bal',   value: `${balance} ${deal.coin}`,         inline: true },
-      { name: '📈 Rate',         value: deal.usdPrice ? `$${deal.usdPrice.toLocaleString()} / ${deal.coin}` : 'N/A', inline: true },
-      { name: '👤 Buyer',        value: `<@${deal.buyer}>`,                inline: true },
-      { name: '👤 Seller',       value: `<@${deal.seller}>`,               inline: true },
-      { name: '\u200b',          value: '\u200b',                           inline: true },
-      { name: '📦 Description',  value: deal.description },
-      { name: '📬 Wallet',       value: `\`${deal.wallet}\`` },
+      { name: '🔄 Status',     value: `\`${deal.status}\``,       inline: true },
+      { name: '🪙 Coin',       value: deal.coin,                   inline: true },
+      { name: '💵 Deal USD',   value: deal.usdAmount ? `$${deal.usdAmount.toFixed(2)}` : 'N/A', inline: true },
+      { name: '💰 Amount',     value: `${deal.amount} ${deal.coin}`, inline: true },
+      { name: '📊 Escrow Bal', value: `${balance} ${deal.coin}${liveUsdValue ? ` (~$${liveUsdValue})` : ''}`, inline: true },
+      { name: '📈 Live Rate',  value: livePrice ? `$${livePrice.toLocaleString()} / ${deal.coin}` : 'N/A', inline: true },
+      { name: '👤 Buyer',      value: `<@${deal.buyer}>`,          inline: true },
+      { name: '👤 Seller',     value: `<@${deal.seller}>`,         inline: true },
+      { name: '\u200b',        value: '\u200b',                    inline: true },
+      { name: '📦 Description', value: deal.description },
+      { name: '📬 Wallet',     value: `\`${deal.wallet}\`` },
     )
     .setTimestamp(deal.createdAt);
 
   message.channel.send({ embeds: [embed] });
-
-  // Also send plain copyable address
   message.channel.send(`📋 **Deposit address (tap to copy):**\n\`${deal.wallet}\``);
 }
 
@@ -807,7 +1026,10 @@ async function handleDispute(message, args) {
   const embed = new EmbedBuilder()
     .setColor('#ff6600')
     .setTitle(`⚠️ Dispute — \`${dealId}\``)
-    .setDescription(`Filed by <@${message.author.id}>. Admins have been added. Please explain your issue in detail.`);
+    .setDescription(
+      `Filed by <@${message.author.id}>. Admins have been added. Please explain your issue.\n\n` +
+      `Admin command: \`!mm release ${dealId} <address>\``
+    );
   message.channel.send({ embeds: [embed] });
 }
 
@@ -829,28 +1051,60 @@ async function handleAdd(message, args) {
   message.channel.send(`✅ Added <@${user.id}> to this ticket.`);
 }
 
+// ─────────────────────────────────────────────
+// !mm deals  (admin) — list all active deals
+// ─────────────────────────────────────────────
+async function handleDeals(message) {
+  if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator))
+    return message.reply('❌ Admin only.');
+
+  const all = db.all();
+  const active = Object.values(all).filter(v =>
+    v.id?.startsWith('DEAL-') &&
+    v.guildId === message.guild.id &&
+    !['COMPLETED', 'CANCELLED'].includes(v.status)
+  );
+
+  if (!active.length) return message.reply('✅ No active deals at the moment.');
+
+  const lines = active.map(d =>
+    `\`${d.id}\` | ${d.coin} | \`${d.status}\` | <@${d.buyer}> ↔ <@${d.seller}> | $${d.usdAmount?.toFixed(2) ?? '?'}`
+  );
+
+  const embed = new EmbedBuilder()
+    .setColor('#0099ff')
+    .setTitle(`📊 Active Deals — ${active.length} open`)
+    .setDescription(lines.join('\n'))
+    .setTimestamp();
+
+  message.channel.send({ embeds: [embed] });
+}
+
 async function handleHelp(message) {
   const embed = new EmbedBuilder()
     .setColor('#00ff88')
     .setTitle('💎 Escrow Bot — Commands')
-    .setDescription('All amounts are displayed in USD and converted to crypto at the live rate.')
+    .setDescription('All amounts are entered in USD and converted to crypto at the live rate.')
     .addFields(
       { name: '`!mm setup`',                      value: '*(Admin)* Create escrow category + panel channel' },
       { name: '`!mm panel`',                      value: '*(Admin)* Repost the Open Trade button' },
-      { name: '`!mm status <dealID>`',            value: 'View deal status, USD value, and escrow balance' },
-      { name: '`!mm confirm <dealID>`',           value: 'Buyer confirms item received → releases funds' },
+      { name: '`!mm deals`',                      value: '*(Admin)* List all active deals in this server' },
+      { name: '`!mm status <dealID>`',            value: 'View deal status, live balance & current USD value' },
+      { name: '`!mm confirm <dealID>`',           value: 'Buyer confirms receipt → seller can claim funds' },
       { name: '`!mm cancel <dealID>`',            value: 'Cancel deal if no funds sent yet' },
       { name: '`!mm dispute <dealID>`',           value: 'Open dispute — adds admins to ticket' },
       { name: '`!mm release <dealID> <address>`', value: '*(Admin)* Force-release funds to an address' },
       { name: '`!mm add @user`',                  value: '*(Admin)* Add someone to the ticket channel' },
       { name: '`!mm close`',                      value: '*(Admin)* Delete this ticket channel' },
-    );
+    )
+    .setFooter({ text: 'Set AUDIT_LOG_CHANNEL_ID in config.js to enable deal audit logging.' });
   message.channel.send({ embeds: [embed] });
 }
 
 // ─────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────
+
 function findOpenTicketForUser(userId) {
   const all = db.all();
   return Object.values(all).find(
@@ -858,6 +1112,25 @@ function findOpenTicketForUser(userId) {
   ) || null;
 }
 
-client.login(config.TOKEN);
+function findActiveDealBetween(userId1, userId2) {
+  const all = db.all();
+  return Object.values(all).find(v =>
+    v.id?.startsWith('DEAL-') &&
+    !['COMPLETED', 'CANCELLED'].includes(v.status) &&
+    ((v.buyer === userId1 && v.seller === userId2) || (v.buyer === userId2 && v.seller === userId1))
+  ) || null;
+}
 
+function getAddressPlaceholder(coin) {
+  const examples = {
+    BTC:  'bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh',
+    ETH:  '0x71C7656EC7ab88b098defB751B7401B5f6d8976F',
+    LTC:  'ltc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh',
+    SOL:  '7EcDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV',
+    USDT: '0x71C7656EC7ab88b098defB751B7401B5f6d8976F',
+  };
+  return examples[coin] ?? 'Enter your address';
+}
+
+// ─────────────────────────────────────────────
 client.login(config.TOKEN);
