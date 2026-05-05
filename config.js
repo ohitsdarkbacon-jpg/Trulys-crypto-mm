@@ -12,17 +12,17 @@ module.exports = {
   PREFIX: '!',
 
   // Infura API Key — for ETH/USDT — https://infura.io
-  INFURA_KEY: 'YOUR_INFURA_PROJECT_ID',
+  INFURA_KEY: '28362088b1084d088f7f200eca9fbda3',
 
   // BlockCypher Token — for BTC/LTC — https://www.blockcypher.com
-  BLOCKCYPHER_TOKEN: 'YOUR_BLOCKCYPHER_TOKEN',
+  BLOCKCYPHER_TOKEN: '5f5140bfc90840c3a486ccf6a3320004',
 
   // Your fee collection wallet addresses (1% fee goes here)
   FEE_WALLETS: {
-    BTC: 'YOUR_BTC_FEE_WALLET',
-    ETH: 'YOUR_ETH_FEE_WALLET',
-    LTC: 'YOUR_LTC_FEE_WALLET',
-    SOL: 'YOUR_SOL_FEE_WALLET',
-    USDT: 'YOUR_ETH_FEE_WALLET', // USDT uses ETH address
+    BTC: 'bc1qfz9uy464zgw7x8982487cjg2n9vwg8lyfds6wz',
+    ETH: '0x2B7e3690096e27B66C5864aaCD722A923490843F',
+    LTC: 'LggbDmxgvmUKD2x9UsKszQT3XpPMYAsdvW',
+    SOL: 'DoBZvHVJpC2JJgmS5Km7Y5DjgTAq8ej9jTHnvWAy6cqN',
+    USDT: '0x2B7e3690096e27B66C5864aaCD722A923490843F', // USDT uses ETH address
   },
 };
